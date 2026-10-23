@@ -348,13 +348,16 @@ class Model(nn.Module):
             voice.prefix = tuple([_copy_cache(c) for c in group] for group in caches)
         return tuple([_copy_cache(c) for c in group] for group in voice.prefix)
 
-    def _step(self, hidden, frame, history, caches, temperature, top_k, top_p):
+    def _step(
+        self, hidden, frame, history, caches, temperature, top_k, top_p, main_top_k
+    ):
         """One frame: (frame [1, 1, 11], next hidden, history, main token [1]),
-        all lazy."""
+        all lazy. The main token is capped at main_top_k, the codebook heads at
+        top_k."""
         backbone_cache, tower_cache = caches
         logits = self.semantic_head(hidden[:, 0]).astype(mx.float32)
         first = self._candidate_ids[
-            sample_top_k_top_p(logits, temperature, top_k, top_p)
+            sample_top_k_top_p(logits, temperature, main_top_k, top_p)
         ]
         retry = self._candidate_ids[
             sample_top_k_top_p(logits, RAS_TEMPERATURE, RAS_TOP_K, RAS_TOP_P)
@@ -388,6 +391,7 @@ class Model(nn.Module):
         temperature: float,
         top_k: int,
         top_p: float,
+        main_top_k: int,
     ) -> Iterator[mx.array]:
         """Codes [num_codebooks] of each generated frame until EOS.
 
@@ -402,7 +406,7 @@ class Model(nn.Module):
         """
         caches = self._start_caches(frames, system_rows, voice)
         hidden = self._prefill(frames, caches, system_rows, frames.shape[0])
-        args = (caches, temperature, top_k, top_p)
+        args = (caches, temperature, top_k, top_p, main_top_k)
         pending = self._step(hidden, frames[None, -1:], frames[-RAS_WINDOW:, 0], *args)
         mx.async_eval(pending)
         held = None
@@ -432,6 +436,7 @@ class Model(nn.Module):
         temperature: Optional[float] = None,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        main_top_k: Optional[int] = None,
         stream: bool = False,
         streaming_interval: float = 0.32,
         first_chunk_frames: Optional[int] = None,
@@ -444,6 +449,12 @@ class Model(nn.Module):
         Long text is generated chunk by chunk; each chunk sees the first and the
         previous chunk as history, and max_tokens caps the frames of one chunk.
         Sampling arguments left as None use the reference recipe.
+        main_top_k caps the main (semantic or EOS) token separately from the
+        codebook heads, which keep top_k; None caps it at top_k like the heads,
+        0 leaves it uncapped. Capping the main token at 30 is what lets some
+        takes collapse into silence until max_tokens: uncapped, the codebook
+        heads still at 30, far fewer takes do (vllm-omni #9157, sglang-omni
+        #2890, mlx-audio #1026).
         With stream=True, audio is yielded every streaming_interval seconds;
         first_chunk_frames sets a smaller first piece for a faster first audio.
         Delivery cues go inline, e.g. "[whispers]". Other keyword arguments that
@@ -458,10 +469,16 @@ class Model(nn.Module):
             )
         validate_text(text, "text")
         max_tokens = max_tokens or DEFAULT_MAX_FRAMES
+        top_k = DEFAULT_TOP_K if top_k is None else top_k
+        if main_top_k is None:
+            main_top_k = top_k
+        elif main_top_k <= 0:
+            main_top_k = self._candidate_ids.shape[0]
         sampling = (
             DEFAULT_TEMPERATURE if temperature is None else temperature,
-            DEFAULT_TOP_K if top_k is None else top_k,
+            top_k,
             DEFAULT_TOP_P if top_p is None else top_p,
+            main_top_k,
         )
         voice = self._voice(ref_audio, ref_text)
         frame_rate = self.sample_rate / self.codec.frame_length
