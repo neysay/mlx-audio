@@ -535,7 +535,44 @@ class TestGeneration(unittest.TestCase):
         frames, system_rows = model.build_frames([], [], "Hallo du.")
         voice = model._voice(None, None)
         with patch.object(model, "_step", side_effect=self.scripted_step(mains)):
-            return list(model._frames(frames, system_rows, voice, 8, 0.7, 30, 0.7))
+            return list(model._frames(frames, system_rows, voice, 8, 0.7, 30, 0.7, 30))
+
+    def step_caps(self, **kwargs) -> list[tuple[int, int]]:
+        """(vocabulary, top_k) of every draw while generate() runs one frame."""
+        draws = []
+        module = "mlx_audio.tts.models.fish_drama3.drama3"
+
+        def recording(logits, temperature, top_k, top_p, keep_crossing=False):
+            draws.append((logits.shape[-1], top_k))
+            return sample_top_k_top_p(logits, temperature, top_k, top_p, keep_crossing)
+
+        mx.random.seed(5)
+        with patch(f"{module}.sample_top_k_top_p", side_effect=recording):
+            list(self.model.generate("Hallo.", max_tokens=1, **kwargs))
+        return draws
+
+    def test_main_token_is_capped_like_the_heads_by_default(self):
+        main = self.model._candidate_ids.shape[0]
+        draws = self.step_caps(top_k=7)
+        self.assertIn((main, 7), draws)  # the main draw
+        self.assertIn((TOWER_VOCAB, 7), draws)  # a codebook head
+
+    def test_main_top_k_caps_only_the_main_token(self):
+        main = self.model._candidate_ids.shape[0]
+        draws = self.step_caps(top_k=7, main_top_k=0)
+        main_draws = [k for vocab, k in draws if vocab == main]
+        head_draws = [k for vocab, k in draws if vocab == TOWER_VOCAB]
+        # Uncapped main draw; the repetition-aware redraw keeps its own recipe.
+        self.assertIn(main, main_draws)
+        self.assertNotIn(7, main_draws)
+        self.assertTrue(head_draws)
+        self.assertTrue(all(k == 7 for k in head_draws))
+
+    def test_main_top_k_sets_its_own_cap(self):
+        main = self.model._candidate_ids.shape[0]
+        draws = self.step_caps(top_k=7, main_top_k=3)
+        self.assertIn((main, 3), draws)
+        self.assertNotIn((main, 7), draws)
 
     def test_semantic_zero_right_before_eos_is_dropped(self):
         # <|semantic:0|> right before EOS decodes to a click, so it is dropped.
